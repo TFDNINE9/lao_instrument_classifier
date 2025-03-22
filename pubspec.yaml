@@ -12,7 +12,7 @@ dependencies:
   cupertino_icons: ^1.0.2
   
   # TensorFlow Lite
-  tflite_flutter: ^0.9.0
+  tflite_flutter: ^0.11.0
   
   # Audio recording and playback
   record: ^4.4.4
@@ -29,7 +29,7 @@ dependencies:
   percent_indicator: ^4.2.2
   
   # Permissions
-  permission_handler: ^10.2.0
+  permission_handler: ^11.4.0
   
   # Utilities
   path_provider: ^2.0.11
@@ -44,6 +44,6 @@ flutter:
   uses-material-design: true
   
   assets:
-    - assets/models/
+    - assets/model/
     - assets/images/
     - assets/test_audio/

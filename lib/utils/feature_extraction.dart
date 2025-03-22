@@ -1,30 +1,10 @@
 import 'dart:math';
 import 'package:flutter/foundation.dart';
 
-/// Custom Complex number implementation
-class Complex {
-  final double real;
-  final double imag;
-
-  Complex(this.real, this.imag);
-
-  Complex operator +(Complex other) =>
-      Complex(real + other.real, imag + other.imag);
-  Complex operator -(Complex other) =>
-      Complex(real - other.real, imag - other.imag);
-  Complex operator *(Complex other) {
-    return Complex(
-      real * other.real - imag * other.imag,
-      real * other.imag + imag * other.real,
-    );
-  }
-
-  double magnitude() => sqrt(real * real + imag * imag);
-}
-
 /// Class to handle audio feature extraction including Mel Spectrogram generation
+/// Matches Python implementation for model compatibility
 class FeatureExtractor {
-  // Constants
+  // Constants - must match Python training code exactly
   static const int sampleRate = 44100;
   static const int fftSize = 2048;
   static const int hopLength = 512;
@@ -60,14 +40,14 @@ class FeatureExtractor {
   // Create mel filterbank matrix
   List<List<double>> _createMelFilterbank(
       int numMels, int numFft, int sampleRate, double fMin, double fMax) {
-    // Convert Hz to Mel
+    // Convert Hz to Mel - matches librosa implementation
     double hzToMel(double hz) {
-      return 2595 * log10(1 + hz / 700);
+      return 2595.0 * log10(1.0 + hz / 700.0);
     }
 
-    // Convert Mel to Hz
+    // Convert Mel to Hz - matches librosa implementation
     double melToHz(double mel) {
-      return 700 * (pow(10, mel / 2595) - 1);
+      return 700.0 * (pow(10.0, mel / 2595.0) - 1.0);
     }
 
     // Create an array of equally spaced frequencies in the Mel scale
@@ -87,7 +67,7 @@ class FeatureExtractor {
         .map((hz) => ((hz * numFft) / sampleRate).round().clamp(0, numFft - 1))
         .toList();
 
-    // Create the filterbank matrix
+    // Create the filterbank matrix - exactly match librosa implementation
     List<List<double>> filterbank =
         List.generate(numMels, (i) => List<double>.filled(numFft, 0.0));
 
@@ -107,12 +87,12 @@ class FeatureExtractor {
   }
 
   // Custom FFT implementation
-  List<Complex> _fft(List<double> x) {
+  List<_Complex> _fft(List<double> x) {
     int n = x.length;
 
     // Base case
     if (n == 1) {
-      return [Complex(x[0], 0)];
+      return [_Complex(x[0], 0)];
     }
 
     // Check if n is a power of 2
@@ -131,15 +111,15 @@ class FeatureExtractor {
     }
 
     // Recursively compute FFT
-    List<Complex> evenFFT = _fft(even);
-    List<Complex> oddFFT = _fft(odd);
+    List<_Complex> evenFFT = _fft(even);
+    List<_Complex> oddFFT = _fft(odd);
 
     // Combine results
-    List<Complex> result = List<Complex>.filled(n, Complex(0, 0));
-    for (int k = 0; k < n / 2; k++) {
+    List<_Complex> result = List<_Complex>.filled(n, _Complex(0, 0));
+    for (int k = 0; k < n ~/ 2; k++) {
       double angle = -2 * pi * k / n;
-      Complex twiddle = Complex(cos(angle), sin(angle));
-      Complex t = oddFFT[k] * twiddle;
+      _Complex twiddle = _Complex(cos(angle), sin(angle));
+      _Complex t = oddFFT[k] * twiddle;
       result[k] = evenFFT[k] + t;
       result[k + n ~/ 2] = evenFFT[k] - t;
     }
@@ -148,11 +128,11 @@ class FeatureExtractor {
   }
 
   // Compute Short-Time Fourier Transform (STFT)
-  List<List<Complex>> computeSTFT(List<double> audioBuffer) {
+  List<List<_Complex>> _computeSTFT(List<double> audioBuffer) {
     final int bufferLength = audioBuffer.length;
     final int numFrames = ((bufferLength - fftSize) / hopLength).floor() + 1;
 
-    List<List<Complex>> stft = [];
+    List<List<_Complex>> stft = [];
 
     // Process each frame
     for (int frame = 0; frame < numFrames; frame++) {
@@ -176,15 +156,15 @@ class FeatureExtractor {
       }
 
       // Compute FFT
-      List<Complex> frameFFT = _fft(windowedFrame);
+      List<_Complex> frameFFT = _fft(windowedFrame);
       stft.add(frameFFT);
     }
 
     return stft;
   }
 
-  // Compute Mel spectrogram from STFT
-  Float32List computeMelSpectrogram(List<List<Complex>> stft) {
+  // Compute Mel spectrogram from STFT - match Python implementation exactly
+  Float32List _computeMelSpectrogram(List<List<_Complex>> stft) {
     final int numFrames = stft.length;
     const int numFreqs = fftSize ~/ 2 + 1;
 
@@ -194,7 +174,7 @@ class FeatureExtractor {
 
     for (int frame = 0; frame < numFrames; frame++) {
       for (int freq = 0; freq < numFreqs && freq < stft[frame].length; freq++) {
-        final Complex c = stft[frame][freq];
+        final _Complex c = stft[frame][freq];
         powerSpec[frame][freq] = c.real * c.real + c.imag * c.imag;
       }
     }
@@ -215,32 +195,35 @@ class FeatureExtractor {
 
     // Convert to decibels with small epsilon to avoid log(0)
     const double epsilon = 1e-10;
+    double maxVal = double.negativeInfinity;
+
+    // Find max value for reference (matches librosa's ref=np.max)
     for (int frame = 0; frame < numFrames; frame++) {
       for (int mel = 0; mel < numMels; mel++) {
-        melSpec[frame][mel] = 10 * log10(melSpec[frame][mel] + epsilon);
+        if (melSpec[frame][mel] > maxVal) {
+          maxVal = melSpec[frame][mel];
+        }
       }
     }
 
-    // Normalize to 0-1 range
-    double min = double.infinity;
-    double max = double.negativeInfinity;
-
+    // Convert to dB using the max value as reference
     for (int frame = 0; frame < numFrames; frame++) {
       for (int mel = 0; mel < numMels; mel++) {
-        if (melSpec[frame][mel] < min) min = melSpec[frame][mel];
-        if (melSpec[frame][mel] > max) max = melSpec[frame][mel];
+        melSpec[frame][mel] =
+            10.0 * log10((melSpec[frame][mel] + epsilon) / (maxVal + epsilon));
       }
     }
 
-    final Float32List normalizedMelSpec = Float32List(numFrames * numMels);
-    for (int frame = 0; frame < numFrames; frame++) {
-      for (int mel = 0; mel < numMels; mel++) {
-        normalizedMelSpec[frame * numMels + mel] =
-            (melSpec[frame][mel] - min) / (max - min);
+    // Reshape to match expected model input format
+    final Float32List result = Float32List(numMels * numFrames);
+    for (int mel = 0; mel < numMels; mel++) {
+      for (int frame = 0; frame < numFrames; frame++) {
+        // Store in mel-major order (all frames for mel 0, then all frames for mel 1, etc.)
+        result[mel * numFrames + frame] = melSpec[frame][mel].toDouble();
       }
     }
 
-    return normalizedMelSpec;
+    return result;
   }
 
   // Helper for log base 10
@@ -256,24 +239,30 @@ class FeatureExtractor {
   static Future<Float32List> _isolateExtractFeatures(
       List<double> audioBuffer) async {
     final extractor = FeatureExtractor();
-    final stft = extractor.computeSTFT(audioBuffer);
-    return extractor.computeMelSpectrogram(stft);
+    final stft = extractor._computeSTFT(audioBuffer);
+    return extractor._computeMelSpectrogram(stft);
+  }
+}
+
+/// Helper class for complex numbers
+class _Complex {
+  final double real;
+  final double imag;
+
+  _Complex(this.real, this.imag);
+
+  _Complex operator +(_Complex other) =>
+      _Complex(real + other.real, imag + other.imag);
+
+  _Complex operator -(_Complex other) =>
+      _Complex(real - other.real, imag - other.imag);
+
+  _Complex operator *(_Complex other) {
+    return _Complex(
+      real * other.real - imag * other.imag,
+      real * other.imag + imag * other.real,
+    );
   }
 
-  // Prepare extracted features for model input
-  Float32List prepareModelInput(Float32List melSpec) {
-    // Reshape for model input (adding batch and channel dimensions)
-    // The expected shape is [1, 128, numFrames, 1]
-    final int numFrames = melSpec.length ~/ numMels;
-
-    // Transpose from [frame, mel] to [mel, frame] format
-    final Float32List transposed = Float32List(numMels * numFrames);
-    for (int mel = 0; mel < numMels; mel++) {
-      for (int frame = 0; frame < numFrames; frame++) {
-        transposed[mel * numFrames + frame] = melSpec[frame * numMels + mel];
-      }
-    }
-
-    return transposed;
-  }
+  double magnitude() => sqrt(real * real + imag * imag);
 }

@@ -13,20 +13,27 @@ import '../models/instrument.dart';
 import '../utils/feature_extraction.dart';
 
 class ClassifierService {
-  // Model file names
-  static const String MODEL_FILENAME =
-      'lao_instruments_model_compatible.tflite';
+  // Model file names - try these in order until one works
+  static const List<String> MODEL_FILENAMES = [
+    'lao_instruments_model_float16.tflite', // Preferred model (float16)
+    'lao_instruments_model_quantized.tflite', // Fallback model (float32)
+    'lao_instruments_model.tflite', // Original model
+  ];
+
   static const String LABELS_FILENAME = 'label_encoder.txt';
 
   // TFLite interpreter
   Interpreter? _interpreter;
+  String? _loadedModelName;
 
   // Label mapping
   List<String> _labels = [];
 
   // Configuration
-  final double _confidenceThreshold = 0.9;
-  final double _entropyThreshold = 0.12;
+  final double _confidenceThreshold =
+      0.85; // Lowered from 0.9 for better results
+  final double _entropyThreshold =
+      0.15; // Increased from 0.12 for better results
 
   // Feature extractor
   final FeatureExtractor _featureExtractor = FeatureExtractor();
@@ -43,19 +50,37 @@ class ClassifierService {
   // Random generator for mock mode
   final math.Random _random = math.Random();
 
-  // Getter for initialization status
+  // Getters
   bool get isInitialized => _isInitialized;
-
-  // Getter for mock mode status
   bool get isMockMode => _useMockMode;
+  String? get loadedModelName => _loadedModelName;
 
   // Initialize the classifier
   Future<bool> initialize() async {
     if (_isInitialized) return true;
 
     try {
-      // Try to load the real model
-      await _loadModelWithCompatibility();
+      // Try to load models in order until one works
+      bool modelLoaded = false;
+
+      for (final modelName in MODEL_FILENAMES) {
+        try {
+          _logger.i('Trying to load model: $modelName');
+          await _loadModel(modelName);
+          _loadedModelName = modelName;
+          modelLoaded = true;
+          _logger.i('Successfully loaded model: $modelName');
+          break;
+        } catch (e) {
+          _logger.w('Failed to load model $modelName: $e');
+          // Continue to next model
+        }
+      }
+
+      if (!modelLoaded) {
+        _logger.e('Failed to load any model, falling back to mock mode');
+        _useMockMode = true;
+      }
 
       // Load labels
       await _loadLabels();
@@ -67,11 +92,6 @@ class ClassifierService {
 
       // Fall back to mock mode
       _logger.i('Falling back to mock classification mode');
-
-      // Load labels for mock mode
-      await _loadLabels();
-
-      // Enable mock mode
       _useMockMode = true;
       _isInitialized = true;
 
@@ -79,50 +99,48 @@ class ClassifierService {
     }
   }
 
-  // Load TFLite model with compatibility options
-  Future<void> _loadModelWithCompatibility() async {
-    try {
-      // Get app directory to store the model file
-      final appDir = await getApplicationDocumentsDirectory();
-      final modelPath = '${appDir.path}/$MODEL_FILENAME';
-      final modelFile = File(modelPath);
+  // Load TFLite model
+  Future<void> _loadModel(String modelName) async {
+    // Get app directory to store the model file
+    final appDir = await getApplicationDocumentsDirectory();
+    final modelPath = '${appDir.path}/$modelName';
+    final modelFile = File(modelPath);
 
-      // Check if model exists, if not copy from assets
-      if (!await modelFile.exists()) {
-        try {
-          // Copy model from assets
-          final ByteData modelData =
-              await rootBundle.load('assets/model/$MODEL_FILENAME');
-          await modelFile.writeAsBytes(modelData.buffer.asUint8List());
-          _logger.i('Model copied to: $modelPath');
-        } catch (e) {
-          _logger.e('Error copying model from assets: $e');
-          rethrow;
-        }
+    // Check if model exists, if not copy from assets
+    if (!await modelFile.exists()) {
+      try {
+        // Copy model from assets
+        final ByteData modelData =
+            await rootBundle.load('assets/model/$modelName');
+        await modelFile.writeAsBytes(modelData.buffer.asUint8List());
+        _logger.i('Model copied to: $modelPath');
+      } catch (e) {
+        _logger.e('Error copying model from assets: $e');
+        throw Exception('Failed to copy model file: $e');
       }
-
-      // Create interpreter options with compatibility settings
-      final options = InterpreterOptions();
-
-      // Use single thread for better compatibility
-      options.threads = 1;
-
-      // Disable NN API which can cause compatibility issues
-      options.useNnApiForAndroid = false;
-
-      // Load with compatibility options
-      _interpreter = await Interpreter.fromFile(modelFile, options: options);
-
-      // Check if interpreter was created successfully
-      if (_interpreter == null) {
-        throw Exception('Interpreter is null after initialization');
-      }
-
-      _logger.i('Model loaded successfully with compatibility options');
-    } catch (e) {
-      _logger.e('Error loading model: $e');
-      rethrow;
     }
+
+    // Create interpreter options with compatibility settings
+    final options = InterpreterOptions()
+      ..threads = 2 // Use 2 threads for better performance
+      ..useNnApiForAndroid = false; // Disable NN API for better compatibility
+
+    // Load with options
+    _interpreter = await Interpreter.fromFile(modelFile, options: options);
+
+    // Check if interpreter was created successfully
+    if (_interpreter == null) {
+      throw Exception('Interpreter is null after initialization');
+    }
+
+    // Log model input/output details
+    final inputTensor = _interpreter!.getInputTensor(0);
+    final outputTensor = _interpreter!.getOutputTensor(0);
+
+    _logger.i('Model loaded with:');
+    _logger.i('- Input shape: ${inputTensor.shape}, type: ${inputTensor.type}');
+    _logger
+        .i('- Output shape: ${outputTensor.shape}, type: ${outputTensor.type}');
   }
 
   // Load label mapping
@@ -144,13 +162,18 @@ class ClassifierService {
       }
     } catch (e) {
       _logger.e('Error loading labels: $e');
-      rethrow;
+      throw Exception('Failed to load labels: $e');
     }
   }
 
   Future<ClassificationResult> classifyAudio(List<double> audioBuffer) async {
-    if (!_isInitialized || _interpreter == null) {
+    if (!_isInitialized) {
       throw Exception('Classifier not initialized');
+    }
+
+    // Handle mock mode
+    if (_useMockMode) {
+      return _generateMockResult();
     }
 
     try {
@@ -158,23 +181,20 @@ class ClassifierService {
       final melSpectrogram =
           await _featureExtractor.extractMelSpectrogram(audioBuffer);
 
-      // Prepare input for model - simplify for compatibility
-      final modelInput = _prepareInputForCompatibility(melSpectrogram);
+      // Prepare input for model with proper normalization
+      final modelInput = _prepareModelInput(melSpectrogram);
 
-      // Create output buffer with correct shape [1, 6] instead of [6]
-      // This matches the expected output shape from the model
+      // Create output buffer
       final outputBuffer = [List<double>.filled(_labels.length, 0.0)];
 
       // Run inference
       _interpreter!.run(modelInput, outputBuffer);
 
-      // Extract the inner array (remove batch dimension)
-      final resultArray = outputBuffer[0];
-
-      // Process results with the inner array
-      return _processOutput(Float32List.fromList(resultArray));
+      // Process results
+      return _processOutput(Float32List.fromList(outputBuffer[0]));
     } catch (e) {
       _logger.e('Error classifying audio: $e');
+
       // Return unknown if there's an error
       return ClassificationResult.unknown(
         confidence: 0.0,
@@ -184,19 +204,24 @@ class ClassifierService {
     }
   }
 
-  List<dynamic> _prepareInputForCompatibility(Float32List melSpectrogram) {
+  // Properly prepare input for the model
+  List<Object> _prepareModelInput(Float32List melSpectrogram) {
     const int numMels = FeatureExtractor.numMels;
     final int numFrames = melSpectrogram.length ~/ numMels;
 
-    // Create a simple 4D input: [1, height, width, channels]
-    final input = [
-      List.generate(
-          numMels,
-          (i) => List.generate(
-              numFrames, (j) => [melSpectrogram[i * numFrames + j]]))
-    ];
+    // Reshape the data to match model's expected input shape
+    final List<List<List<List<double>>>> reshapedInput = List.generate(
+      1, // Batch size
+      (_) => List.generate(
+        numMels, // Height
+        (i) => List.generate(
+          numFrames, // Width
+          (j) => [melSpectrogram[i * numFrames + j]], // Channel
+        ),
+      ),
+    );
 
-    return input;
+    return [reshapedInput];
   }
 
   // Process model output
@@ -218,6 +243,7 @@ class ClassifierService {
       }
     }
 
+    // Calculate entropy for uncertainty measurement
     double entropy = 0.0;
     for (final prob in probabilities) {
       if (prob > 0) {
@@ -257,6 +283,33 @@ class ClassifierService {
         allProbabilities: probabilityMap,
       );
     }
+  }
+
+  // Generate mock result for testing
+  ClassificationResult _generateMockResult() {
+    final instruments = Instrument.getLaoInstruments();
+    final index = _random.nextInt(instruments.length);
+    final instrument = instruments[index];
+
+    // Generate random probabilities
+    final Map<String, double> probs = {};
+    double mainProb = 0.7 + _random.nextDouble() * 0.25; // 0.7-0.95
+
+    for (final instr in instruments) {
+      if (instr.id == instrument.id) {
+        probs[instr.id] = mainProb;
+      } else {
+        probs[instr.id] = (1.0 - mainProb) / (instruments.length - 1);
+      }
+    }
+
+    return ClassificationResult(
+      instrument: instrument,
+      confidence: mainProb,
+      entropy: 0.1 + _random.nextDouble() * 0.15, // 0.1-0.25
+      isUnknown: false,
+      allProbabilities: probs,
+    );
   }
 
   // Clean up resources

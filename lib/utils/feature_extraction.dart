@@ -1,4 +1,5 @@
 import 'dart:math';
+import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 
 /// Class to handle audio feature extraction including Mel Spectrogram generation
@@ -214,12 +215,15 @@ class FeatureExtractor {
       }
     }
 
-    // Reshape to match expected model input format
-    final Float32List result = Float32List(numMels * numFrames);
+    // Create flat Float32List for model input
+    final int totalSize = numMels * numFrames;
+    final Float32List result = Float32List(totalSize);
+    int index = 0;
+
+    // Flatten in row-major order (all frames for mel 0, then all frames for mel 1, etc.)
     for (int mel = 0; mel < numMels; mel++) {
       for (int frame = 0; frame < numFrames; frame++) {
-        // Store in mel-major order (all frames for mel 0, then all frames for mel 1, etc.)
-        result[mel * numFrames + frame] = melSpec[frame][mel].toDouble();
+        result[index++] = melSpec[frame][mel];
       }
     }
 
@@ -240,7 +244,10 @@ class FeatureExtractor {
       List<double> audioBuffer) async {
     final extractor = FeatureExtractor();
     final stft = extractor._computeSTFT(audioBuffer);
-    return extractor._computeMelSpectrogram(stft);
+    final features = extractor._computeMelSpectrogram(stft);
+
+    // Ensure this is always Float32List
+    return features;
   }
 }
 

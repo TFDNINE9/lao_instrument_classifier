@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
+import 'dart:convert';
 
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
@@ -13,27 +14,29 @@ import '../models/instrument.dart';
 import '../utils/feature_extraction.dart';
 
 class ClassifierService {
-  // Model file names - try these in order until one works
+  // Model file names - updated for DNN model
   static const List<String> MODEL_FILENAMES = [
-    'lao_instruments_model_float16.tflite', // Preferred model (float16)
-    'lao_instruments_model_quantized.tflite', // Fallback model (float32)
-    'lao_instruments_model.tflite', // Original model
+    'lao_instruments_model_dnn_float16.tflite', // Preferred model (float16)
+    'lao_instruments_model_dnn.tflite', // Original model
   ];
 
   static const String LABELS_FILENAME = 'label_encoder.txt';
+  static const String INPUT_INFO_FILENAME =
+      'lao_instruments_model_dnn_input_info.json';
 
   // TFLite interpreter
   Interpreter? _interpreter;
   String? _loadedModelName;
 
+  // Input shape information
+  Map<String, dynamic>? _inputInfo;
+
   // Label mapping
   List<String> _labels = [];
 
   // Configuration
-  final double _confidenceThreshold =
-      0.85; // Lowered from 0.9 for better results
-  final double _entropyThreshold =
-      0.15; // Increased from 0.12 for better results
+  final double _confidenceThreshold = 0.85;
+  final double _entropyThreshold = 0.15;
 
   // Feature extractor
   final FeatureExtractor _featureExtractor = FeatureExtractor();
@@ -60,6 +63,12 @@ class ClassifierService {
     if (_isInitialized) return true;
 
     try {
+      // Load labels
+      await _loadLabels();
+
+      // Load input shape info
+      await _loadInputInfo();
+
       // Try to load models in order until one works
       bool modelLoaded = false;
 
@@ -81,9 +90,6 @@ class ClassifierService {
         _logger.e('Failed to load any model, falling back to mock mode');
         _useMockMode = true;
       }
-
-      // Load labels
-      await _loadLabels();
 
       _isInitialized = true;
       return true;
@@ -126,7 +132,7 @@ class ClassifierService {
       ..useNnApiForAndroid = false; // Disable NN API for better compatibility
 
     // Load with options
-    _interpreter = await Interpreter.fromFile(modelFile, options: options);
+    _interpreter = Interpreter.fromFile(modelFile, options: options);
 
     // Check if interpreter was created successfully
     if (_interpreter == null) {
@@ -134,13 +140,29 @@ class ClassifierService {
     }
 
     // Log model input/output details
-    final inputTensor = _interpreter!.getInputTensor(0);
-    final outputTensor = _interpreter!.getOutputTensor(0);
+    final inputTensor = _interpreter!.getInputTensors()[0];
+    final outputTensor = _interpreter!.getOutputTensors()[0];
 
     _logger.i('Model loaded with:');
     _logger.i('- Input shape: ${inputTensor.shape}, type: ${inputTensor.type}');
     _logger
         .i('- Output shape: ${outputTensor.shape}, type: ${outputTensor.type}');
+  }
+
+  // Load input shape information
+  Future<void> _loadInputInfo() async {
+    try {
+      final String infoData =
+          await rootBundle.loadString('assets/model/$INPUT_INFO_FILENAME');
+      _inputInfo = json.decode(infoData);
+      _logger.i('Input info loaded: $_inputInfo');
+    } catch (e) {
+      _logger.w('Could not load input info, using default values: $e');
+      // Default values for flattened mel spectrogram
+      _inputInfo = {
+        "input_size": 44160 // For 128 mel bands and ~345 time frames
+      };
+    }
   }
 
   // Load label mapping
@@ -177,23 +199,46 @@ class ClassifierService {
     }
 
     try {
+      // Log buffer size for debugging
+      _logger.i('Audio buffer length: ${audioBuffer.length} samples');
+
+      // Ensure buffer is the right length for processing
+      List<double> processedBuffer = _padOrTrimBuffer(audioBuffer);
+      _logger.i('Processed buffer length: ${processedBuffer.length} samples');
+
       // Extract features
       final melSpectrogram =
-          await _featureExtractor.extractMelSpectrogram(audioBuffer);
+          await _featureExtractor.extractMelSpectrogram(processedBuffer);
+      _logger.i('Mel spectrogram length: ${melSpectrogram.length} elements');
 
-      // Prepare input for model with proper normalization
-      final modelInput = _prepareModelInput(melSpectrogram);
+      // Get required input size from model
+      final inputSize = _inputInfo?['input_size'] ?? 44160;
+
+      // Create properly typed input for TensorFlow Lite
+      // Create a direct Float32List (not wrapped in another list)
+      final inputData = Float32List(inputSize);
+
+      // Copy available data
+      final copyLength = math.min<int>(melSpectrogram.length, inputSize);
+      for (int i = 0; i < copyLength; i++) {
+        inputData[i] = melSpectrogram[i];
+      }
 
       // Create output buffer
-      final outputBuffer = [List<double>.filled(_labels.length, 0.0)];
+      final outputSize = _labels.length;
+      final outputData = Float32List(outputSize);
 
-      // Run inference
-      _interpreter!.run(modelInput, outputBuffer);
+      // Use simple run method with properly typed data
+      _interpreter!.run(inputData, outputData);
+
+      // Log output for debugging
+      _logger.i('Raw output: ${outputData.toList()}');
 
       // Process results
-      return _processOutput(Float32List.fromList(outputBuffer[0]));
-    } catch (e) {
+      return _processOutput(outputData);
+    } catch (e, stackTrace) {
       _logger.e('Error classifying audio: $e');
+      _logger.e('Stack trace: $stackTrace');
 
       // Return unknown if there's an error
       return ClassificationResult.unknown(
@@ -204,35 +249,62 @@ class ClassifierService {
     }
   }
 
-  // Properly prepare input for the model
-  List<Object> _prepareModelInput(Float32List melSpectrogram) {
-    const int numMels = FeatureExtractor.numMels;
-    final int numFrames = melSpectrogram.length ~/ numMels;
+  // Helper method to ensure audio buffer has the right length
+  List<double> _padOrTrimBuffer(List<double> buffer) {
+    // Target duration in samples (4 seconds at 44.1kHz)
+    const targetLength = 4 * 44100;
 
-    // Reshape the data to match model's expected input shape
-    final List<List<List<List<double>>>> reshapedInput = List.generate(
-      1, // Batch size
-      (_) => List.generate(
-        numMels, // Height
-        (i) => List.generate(
-          numFrames, // Width
-          (j) => [melSpectrogram[i * numFrames + j]], // Channel
-        ),
-      ),
-    );
-
-    return [reshapedInput];
+    if (buffer.length == targetLength) {
+      return buffer;
+    } else if (buffer.length > targetLength) {
+      // Take the last 4 seconds if buffer is too long
+      return buffer.sublist(buffer.length - targetLength);
+    } else {
+      // Pad with zeros if buffer is too short
+      final result = List<double>.filled(targetLength, 0.0);
+      // Copy existing samples
+      for (int i = 0; i < buffer.length; i++) {
+        result[i] = buffer[i];
+      }
+      return result;
+    }
   }
 
   // Process model output
   ClassificationResult _processOutput(Float32List outputBuffer) {
-    final List<double> probabilities = outputBuffer.toList();
+    // Log raw output for debugging
+    _logger.i('Raw output buffer length: ${outputBuffer.length}');
+    if (outputBuffer.isNotEmpty) {
+      _logger.i('First few values: ${outputBuffer.take(5).toList()}');
+    }
+
+    // Make sure we only take as many values as we have labels
+    final List<double> probabilities = [];
+    for (int i = 0; i < math.min(outputBuffer.length, _labels.length); i++) {
+      probabilities.add(outputBuffer[i]);
+    }
+
+    // Apply softmax if needed (if values don't sum to ~1.0)
+    double sum = probabilities.fold(0.0, (sum, item) => sum + item);
+    if (sum < 0.9 || sum > 1.1) {
+      _logger.i('Applying softmax normalization (sum=$sum)');
+      // Softmax calculation
+      final List<double> expValues =
+          probabilities.map((p) => math.exp(p)).toList();
+      final double expSum = expValues.fold(0.0, (sum, item) => sum + item);
+      for (int i = 0; i < probabilities.length; i++) {
+        probabilities[i] = expValues[i] / expSum;
+      }
+    }
+
     final Map<String, double> probabilityMap = {};
 
+    // Create probability map
     for (int i = 0; i < _labels.length && i < probabilities.length; i++) {
       probabilityMap[_labels[i]] = probabilities[i];
     }
 
+    // Find the maximum probability and its index
     int maxIndex = 0;
     double maxProb = probabilities.isNotEmpty ? probabilities[0] : 0.0;
 
@@ -314,6 +386,9 @@ class ClassifierService {
 
   // Clean up resources
   void dispose() {
-    _interpreter?.close();
+    if (_interpreter != null) {
+      _interpreter!.close();
+      _interpreter = null;
+    }
   }
 }

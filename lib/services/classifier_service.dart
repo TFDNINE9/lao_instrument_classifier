@@ -12,6 +12,7 @@ import 'package:logger/logger.dart';
 import '../models/classification_result.dart';
 import '../models/instrument.dart';
 import '../utils/feature_extraction.dart';
+import '../models/tf_lite_helper.dart';
 
 class ClassifierService {
   // Model file names - updated for DNN model
@@ -29,14 +30,14 @@ class ClassifierService {
   String? _loadedModelName;
 
   // Input shape information
-  Map<String, dynamic>? _inputInfo;
+  Map<String, int>? _inputInfo;
 
   // Label mapping
   List<String> _labels = [];
 
   // Configuration
-  final double _confidenceThreshold = 0.85;
-  final double _entropyThreshold = 0.15;
+  final double _confidenceThreshold = 0.90;
+  final double _entropyThreshold = 0.1;
 
   // Feature extractor
   final FeatureExtractor _featureExtractor = FeatureExtractor();
@@ -75,11 +76,14 @@ class ClassifierService {
       for (final modelName in MODEL_FILENAMES) {
         try {
           _logger.i('Trying to load model: $modelName');
-          await _loadModel(modelName);
-          _loadedModelName = modelName;
-          modelLoaded = true;
-          _logger.i('Successfully loaded model: $modelName');
-          break;
+          final interpreter = await TFLiteHelper.loadInterpreter(modelName);
+          if (interpreter != null) {
+            _interpreter = interpreter;
+            _loadedModelName = modelName;
+            modelLoaded = true;
+            _logger.i('Successfully loaded model: $modelName');
+            break;
+          }
         } catch (e) {
           _logger.w('Failed to load model $modelName: $e');
           // Continue to next model
@@ -105,7 +109,7 @@ class ClassifierService {
     }
   }
 
-  // Load TFLite model
+  // Load TFLite model manually - not used anymore, replaced by TFLiteHelper
   Future<void> _loadModel(String modelName) async {
     // Get app directory to store the model file
     final appDir = await getApplicationDocumentsDirectory();
@@ -169,9 +173,10 @@ class ClassifierService {
   Future<void> _loadLabels() async {
     try {
       try {
-        final String labelsData =
-            await rootBundle.loadString('assets/model/$LABELS_FILENAME');
-        _labels = labelsData.trim().split('\n');
+        // final String labelsData =
+        //     await rootBundle.loadString('assets/model/$LABELS_FILENAME');
+        // _labels = labelsData.trim().split('\n');
+        _labels = ['kheang', 'kong_vong', 'pin', 'ra_nad', 'sing', 'sor_ou'];
         _logger.i('Labels loaded successfully: $_labels');
       } catch (e) {
         _logger.w(
@@ -213,29 +218,47 @@ class ClassifierService {
 
       // Get required input size from model
       final inputSize = _inputInfo?['input_size'] ?? 44160;
+      _logger.i('Expected model input size: $inputSize');
 
-      // Create properly typed input for TensorFlow Lite
-      // Create a direct Float32List (not wrapped in another list)
-      final inputData = Float32List(inputSize);
+      // Create input tensor data with proper batch dimension
+      final inputShape = [1, inputSize]; // Add batch dimension
+      final outputSize = _labels.length;
+// Add batch dimension
 
-      // Copy available data
-      final copyLength = math.min<int>(melSpectrogram.length, inputSize);
+      // Reshape input tensor if needed
+      if (_interpreter != null &&
+          _interpreter!.getInputTensor(0).shape != inputShape) {
+        _logger.i('Reshaping input tensor to $inputShape');
+        _interpreter!.resizeInputTensor(0, inputShape);
+        _interpreter!.allocateTensors();
+      }
+
+      // Create inputData and copy melSpectrogram into it
+      final inputData = List.filled(inputSize, 0.0);
+      final copyLength = math.min(melSpectrogram.length, inputSize);
       for (int i = 0; i < copyLength; i++) {
         inputData[i] = melSpectrogram[i];
       }
 
-      // Create output buffer
-      final outputSize = _labels.length;
-      final outputData = Float32List(outputSize);
+      _logger.i('Input data prepared, length: ${inputData.length}');
 
-      // Use simple run method with properly typed data
-      _interpreter!.run(inputData, outputData);
+      // Prepare output container
+      List<List<double>> outputBuffer = [List<double>.filled(outputSize, 0.0)];
 
-      // Log output for debugging
-      _logger.i('Raw output: ${outputData.toList()}');
+      // Log tensor shapes before inference
+      _logger.i('Input tensor shape: ${_interpreter!.getInputTensor(0).shape}');
+      _logger
+          .i('Output tensor shape: ${_interpreter!.getOutputTensor(0).shape}');
 
-      // Process results
-      return _processOutput(outputData);
+      // Run inference with batch dimension
+      _interpreter!.run([inputData], outputBuffer);
+      _logger.i('Inference completed successfully');
+
+      // Log the raw output
+      _logger.i('Raw output: ${outputBuffer[0]}');
+
+      // Process the first item in the batch (our only result)
+      return _processOutput(Float32List.fromList(outputBuffer[0]));
     } catch (e, stackTrace) {
       _logger.e('Error classifying audio: $e');
       _logger.e('Stack trace: $stackTrace');

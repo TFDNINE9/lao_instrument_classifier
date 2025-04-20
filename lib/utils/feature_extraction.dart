@@ -221,8 +221,8 @@ class FeatureExtractor {
     int index = 0;
 
     // Flatten in row-major order (all frames for mel 0, then all frames for mel 1, etc.)
-    for (int frame = 0; frame < numFrames; frame++) {
-      for (int mel = 0; mel < numMels; mel++) {
+    for (int mel = 0; mel < numMels; mel++) {
+      for (int frame = 0; frame < numFrames; frame++) {
         result[index++] = melSpec[frame][mel];
       }
     }

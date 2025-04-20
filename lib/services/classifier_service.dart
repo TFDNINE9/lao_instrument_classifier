@@ -5,24 +5,24 @@ import 'dart:typed_data';
 import 'dart:convert';
 
 import 'package:flutter/services.dart';
+import 'package:lao_instrument_classifier/services/audio_processing.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
 import 'package:logger/logger.dart';
 
 import '../models/classification_result.dart';
 import '../models/instrument.dart';
-import '../utils/feature_extraction.dart';
 
 class ClassifierService {
   // Model file names
   static const List<String> MODEL_FILENAMES = [
-    'lao_instruments_model_dnn_float16.tflite', // Preferred model (float16)
-    'lao_instruments_model_dnn.tflite', // Original model
+    'lao_instruments_model_dnn_attention_float16.tflite', // Preferred model (float16)
+    'lao_instruments_model_dnn_attention.tflite', // Original model
   ];
 
   static const String LABELS_FILENAME = 'label_encoder.txt';
   static const String INPUT_INFO_FILENAME =
-      'lao_instruments_model_dnn_input_info.json';
+      'lao_instruments_model_dnn_attention_input_info.json';
 
   // TFLite interpreter
   Interpreter? _interpreter;
@@ -34,12 +34,8 @@ class ClassifierService {
   // Label mapping
   List<String> _labels = [];
 
-  // Configuration
-  final double _confidenceThreshold = 0.85;
-  final double _entropyThreshold = 0.15;
-
-  // Feature extractor
-  final FeatureExtractor _featureExtractor = FeatureExtractor();
+  // Audio processor
+  late AudioProcessor _audioProcessor;
 
   // Logger
   final Logger _logger = Logger();
@@ -63,6 +59,9 @@ class ClassifierService {
     if (_isInitialized) return true;
 
     try {
+      // Initialize the audio processor
+      _audioProcessor = AudioProcessor();
+
       // Load labels
       await _loadLabels();
 
@@ -139,6 +138,9 @@ class ClassifierService {
       throw Exception('Interpreter is null after initialization');
     }
 
+    // Initialize the audio processor with the model
+    await _audioProcessor.initializeModel(modelPath);
+
     // Log model input/output details
     final inputTensor = _interpreter!.getInputTensors()[0];
     final outputTensor = _interpreter!.getOutputTensors()[0];
@@ -158,10 +160,11 @@ class ClassifierService {
       _logger.i('Input info loaded: $_inputInfo');
     } catch (e) {
       _logger.w('Could not load input info, using default values: $e');
-      // Default values for flattened mel spectrogram
+      // Default values for attention model
       _inputInfo = {
-        "input_size":
-            99360 // For 128 mel bands with ~9 second audio (updated for longer duration)
+        "max_segments": 5,
+        "segment_feature_dim": 43648, // Approximate based on 128 mel bands
+        "total_input_size": 218240
       };
     }
   }
@@ -181,10 +184,8 @@ class ClassifierService {
         // Get instrument IDs from the Instrument class
         final instruments = Instrument.getLaoInstruments();
         _labels = instruments.map((i) => i.id).toList();
-        // Add background class if needed
-        if (!_labels.contains('background')) {
-          _labels.add('background');
-        }
+        // Add background class
+        _labels.add('background');
         _logger.i('Using default labels: $_labels');
       }
     } catch (e) {
@@ -207,7 +208,7 @@ class ClassifierService {
       // Log buffer size for debugging
       _logger.i('Audio buffer length: ${audioBuffer.length} samples');
 
-      // Check if the audio is essentially silence
+      // Check if the audio buffer is essentially silence
       if (_isEssentiallySilence(audioBuffer)) {
         _logger
             .i('Audio buffer is essentially silence, returning unknown result');
@@ -218,56 +219,40 @@ class ClassifierService {
         );
       }
 
-      // Ensure buffer is the right length for processing - using 9 seconds (matching your new model)
-      final processedBuffer = _padOrTrimBuffer(audioBuffer);
-      _logger.i('Processed buffer length: ${processedBuffer.length} samples');
+      // Use the audio processor to classify audio
+      final result = await _audioProcessor.classifyAudio(audioBuffer, _labels);
 
-      // Extract features
-      final melSpectrogram =
-          await _featureExtractor.extractMelSpectrogram(processedBuffer);
-      _logger.i('Mel spectrogram length: ${melSpectrogram.length} elements');
+      // Extract data from result
+      final String predictedInstrument = result['instrument'];
+      final double confidence = result['confidence'];
+      final double entropy = result['entropy'];
+      final bool isUnknown = result['isUnknown'];
+      final Map<String, double> allProbabilities = result['allProbabilities'];
 
-      // Get required input size from model
-      final inputSize = _inputInfo?['input_size'] ?? 99360;
-      _logger.i('Expected model input size: $inputSize');
+      // Create classification result
+      if (isUnknown) {
+        return ClassificationResult.unknown(
+          confidence: confidence,
+          entropy: entropy,
+          allProbabilities: allProbabilities,
+        );
+      } else {
+        final instrument = Instrument.findById(predictedInstrument) ??
+            Instrument(
+              id: predictedInstrument,
+              name: predictedInstrument,
+              description: 'A Lao musical instrument.',
+              imagePath: 'assets/images/default_instrument.png',
+            );
 
-      // Create properly typed input for TensorFlow Lite - CRITICAL FIX HERE
-      final inputData = Float32List(inputSize);
-
-      // Copy available data - ensure we don't exceed the input size
-      final copyLength = math.min<int>(melSpectrogram.length, inputSize);
-      for (int i = 0; i < copyLength; i++) {
-        inputData[i] = melSpectrogram[i];
+        return ClassificationResult(
+          instrument: instrument,
+          confidence: confidence,
+          entropy: entropy,
+          isUnknown: false,
+          allProbabilities: allProbabilities,
+        );
       }
-
-      // If melSpectrogram is shorter than expected, zero-pad the rest
-      for (int i = copyLength; i < inputSize; i++) {
-        inputData[i] = 0.0;
-      }
-
-      // Reshape the input tensor to match the model's expected shape - IMPORTANT
-      // Create a 1D tensor view for the model
-      final inputs = [inputData];
-
-      // Log the input shape for debugging
-      _logger.i('Reshaping input tensor to [1, $inputSize]');
-
-      // Create output buffer with the correct shape
-      final outputSize = _labels.length;
-      final outputs = [List<double>.filled(outputSize, 0.0)];
-
-      // Log output shape
-      _logger.i('Output tensor shape: [1, $outputSize]');
-
-      // Run the model with correctly shaped inputs and outputs
-      _interpreter!.run(inputs, outputs);
-      _logger.i('Inference completed successfully');
-
-      // Log output for debugging
-      _logger.i('Raw output: ${outputs[0]}');
-
-      // Process results
-      return _processOutput(outputs[0]);
     } catch (e, stackTrace) {
       _logger.e('Error classifying audio: $e');
       _logger.e('Stack trace: $stackTrace');
@@ -281,7 +266,7 @@ class ClassifierService {
     }
   }
 
-  // Helper method to check if audio is essentially silence
+  // Check if audio buffer is essentially silence
   bool _isEssentiallySilence(List<double> audioBuffer) {
     // Calculate RMS volume
     double sumSquared = 0.0;
@@ -292,130 +277,6 @@ class ClassifierService {
 
     // Return true if below threshold (experiment with this value)
     return rms < 0.01;
-  }
-
-  // Helper method to ensure audio buffer has the right length (9 seconds at 44.1kHz)
-  List<double> _padOrTrimBuffer(List<double> buffer) {
-    // Target duration in samples (9 seconds at 44.1kHz)
-    const targetLength = 9 * 44100; // Updated for 9-second duration
-
-    if (buffer.length == targetLength) {
-      return buffer;
-    } else if (buffer.length > targetLength) {
-      // Take the last 9 seconds if buffer is too long
-      return buffer.sublist(buffer.length - targetLength);
-    } else {
-      // Pad with zeros if buffer is too short
-      final result = List<double>.filled(targetLength, 0.0);
-      // Copy existing samples
-      for (int i = 0; i < buffer.length; i++) {
-        result[i] = buffer[i];
-      }
-      return result;
-    }
-  }
-
-  // Process model output
-  ClassificationResult _processOutput(List<double> outputBuffer) {
-    // Log raw output for debugging
-    _logger.i('Raw output buffer length: ${outputBuffer.length}');
-    _logger.i('Raw output buffer: $outputBuffer');
-
-    // Check if all probabilities are similar (indicating poor discrimination)
-    double min = outputBuffer.isNotEmpty ? outputBuffer[0] : 0.0;
-    double max = min;
-    for (var val in outputBuffer) {
-      if (val < min) min = val;
-      if (val > max) max = val;
-    }
-    _logger.i('Output range: $min to $max (range: ${max - min})');
-
-    if (max - min < 0.01 && outputBuffer.isNotEmpty) {
-      _logger.w(
-          'WARNING: Output probabilities have very small range - likely feature mismatch!');
-    }
-
-    if (outputBuffer.isNotEmpty) {
-      _logger.i('First few values: ${outputBuffer.take(5).toList()}');
-    }
-
-    // Make sure we only take as many values as we have labels
-    final List<double> probabilities = [];
-    for (int i = 0; i < math.min(outputBuffer.length, _labels.length); i++) {
-      probabilities.add(outputBuffer[i]);
-    }
-
-    // Apply softmax if needed (if values don't sum to ~1.0)
-    double sum = probabilities.fold(0.0, (sum, item) => sum + item);
-    if (sum < 0.9 || sum > 1.1) {
-      _logger.i('Applying softmax normalization (sum=$sum)');
-      // Softmax calculation
-      final List<double> expValues =
-          probabilities.map((p) => math.exp(p)).toList();
-      final double expSum = expValues.fold(0.0, (sum, item) => sum + item);
-      for (int i = 0; i < probabilities.length; i++) {
-        probabilities[i] = expValues[i] / expSum;
-      }
-    }
-
-    final Map<String, double> probabilityMap = {};
-
-    // Create probability map
-    for (int i = 0; i < _labels.length && i < probabilities.length; i++) {
-      probabilityMap[_labels[i]] = probabilities[i];
-    }
-
-    // Find the maximum probability and its index
-    int maxIndex = 0;
-    double maxProb = probabilities.isNotEmpty ? probabilities[0] : 0.0;
-
-    for (int i = 1; i < probabilities.length; i++) {
-      if (probabilities[i] > maxProb) {
-        maxProb = probabilities[i];
-        maxIndex = i;
-      }
-    }
-
-    // Calculate entropy for uncertainty measurement
-    double entropy = 0.0;
-    for (final prob in probabilities) {
-      if (prob > 0) {
-        entropy -= prob * math.log(prob) / math.ln2;
-      }
-    }
-
-    final maxEntropy = math.log(_labels.length) / math.ln2;
-    final normalizedEntropy = entropy / maxEntropy;
-
-    final bool isUnknown =
-        maxProb < _confidenceThreshold || normalizedEntropy > _entropyThreshold;
-
-    if (isUnknown) {
-      return ClassificationResult.unknown(
-        confidence: maxProb,
-        entropy: normalizedEntropy,
-        allProbabilities: probabilityMap,
-      );
-    } else {
-      final String predictedId =
-          maxIndex < _labels.length ? _labels[maxIndex] : 'unknown';
-
-      final instrument = Instrument.findById(predictedId) ??
-          Instrument(
-            id: predictedId,
-            name: maxIndex < _labels.length ? _labels[maxIndex] : 'Unknown',
-            description: 'A Lao musical instrument.',
-            imagePath: 'assets/images/default_instrument.png',
-          );
-
-      return ClassificationResult(
-        instrument: instrument,
-        confidence: maxProb,
-        entropy: normalizedEntropy,
-        isUnknown: false,
-        allProbabilities: probabilityMap,
-      );
-    }
   }
 
   // Generate mock result for testing
@@ -451,5 +312,6 @@ class ClassifierService {
       _interpreter!.close();
       _interpreter = null;
     }
+    _audioProcessor.dispose();
   }
 }

@@ -12,6 +12,7 @@ enum ClassifierState {
   ready,
   recording,
   processing,
+  revealingResult,
   permissionDenied,
   error,
 }
@@ -32,11 +33,15 @@ class ClassifierProvider with ChangeNotifier {
   ClassificationResult? _currentResult;
   final List<ClassificationResult> _recentResults = [];
 
-  // Continuous classification timer
-  Timer? _classificationTimer;
+  // Recording configuration
+  final int _recordingDurationSeconds = 5; // 5 seconds of recording
+  Timer? _recordingTimer;
 
   // Audio buffer subscription
   StreamSubscription? _audioStreamSubscription;
+
+  // Recording progress
+  double _recordingProgress = 0.0;
 
   // Public getters
   ClassifierState get state => _state;
@@ -44,6 +49,7 @@ class ClassifierProvider with ChangeNotifier {
   ClassificationResult? get currentResult => _currentResult;
   List<ClassificationResult> get recentResults => _recentResults;
   Stream<double> get volumeStream => _audioService.volumeStream;
+  double get recordingProgress => _recordingProgress;
 
   // Initialize the classifier
   Future<void> initialize() async {
@@ -85,7 +91,7 @@ class ClassifierProvider with ChangeNotifier {
     }
   }
 
-  // Start continuous recording and classification
+  // Start recording for fixed duration
   Future<void> startClassification() async {
     if (_state != ClassifierState.ready) {
       if (_state == ClassifierState.uninitialized) {
@@ -96,6 +102,10 @@ class ClassifierProvider with ChangeNotifier {
     }
 
     try {
+      // Reset recording progress
+      _recordingProgress = 0.0;
+      notifyListeners();
+
       // Start recording
       final started = await _audioService.startRecording();
       if (!started) {
@@ -108,15 +118,28 @@ class ClassifierProvider with ChangeNotifier {
       _state = ClassifierState.recording;
       notifyListeners();
 
-      // Set up audio stream subscription for classification
+      // Start a timer to update recording progress
+      const progressUpdateInterval = Duration(milliseconds: 100);
+      final totalUpdates = _recordingDurationSeconds *
+          (1000 / progressUpdateInterval.inMilliseconds);
+      int currentUpdate = 0;
+
+      _recordingTimer = Timer.periodic(progressUpdateInterval, (timer) {
+        if (currentUpdate < totalUpdates) {
+          currentUpdate++;
+          _recordingProgress = currentUpdate / totalUpdates;
+          notifyListeners();
+        } else {
+          timer.cancel();
+          // Automatically stop recording and process when time is up
+          stopClassification();
+        }
+      });
+
+      // Set up audio stream subscription to collect data
       _audioStreamSubscription =
           _audioService.audioStream.listen((audioBuffer) {
-        // Process every 500ms to avoid overwhelming the device
-        if (_classificationTimer == null || !_classificationTimer!.isActive) {
-          _classificationTimer = Timer(const Duration(milliseconds: 500), () {
-            _classifyCurrentAudio(audioBuffer);
-          });
-        }
+        // Just collect the data, we'll process it when recording stops
       });
     } catch (e) {
       _logger.e('Error starting classification: $e');
@@ -126,58 +149,66 @@ class ClassifierProvider with ChangeNotifier {
     }
   }
 
-  // Stop recording and classification
+  // Stop recording and classify audio
   Future<void> stopClassification() async {
+    // Cancel the progress timer if it's running
+    _recordingTimer?.cancel();
+    _recordingTimer = null;
+
+    // Cancel audio stream subscription
     _audioStreamSubscription?.cancel();
     _audioStreamSubscription = null;
 
-    _classificationTimer?.cancel();
-    _classificationTimer = null;
+    if (_state == ClassifierState.recording) {
+      try {
+        // Update state to processing
+        _state = ClassifierState.processing;
+        notifyListeners();
 
-    if (_state == ClassifierState.recording ||
-        _state == ClassifierState.processing) {
-      await _audioService.stopRecording();
-      _state = ClassifierState.ready;
-      notifyListeners();
-    }
-  }
+        // Stop recording and get the audio buffer
+        final audioBuffer = await _audioService.stopRecording();
 
-  // Classify current audio buffer
-  Future<void> _classifyCurrentAudio(List<double> audioBuffer) async {
-    if (_state != ClassifierState.recording) return;
+        if (audioBuffer.isNotEmpty) {
+          // Process the complete audio buffer
+          final result = await _classifierService.classifyAudio(audioBuffer);
 
-    _state = ClassifierState.processing;
-    notifyListeners();
+          // Update current result
+          _currentResult = result;
 
-    try {
-      final result = await _classifierService.classifyAudio(audioBuffer);
+          // Add to recent results (keep last 10)
+          if (!result.isUnknown || result.confidence > 0.3) {
+            // Only save meaningful results
+            _recentResults.insert(0, result);
+            if (_recentResults.length > 10) {
+              _recentResults.removeLast();
+            }
+          }
+        }
 
-      // Update current result
-      _currentResult = result;
+        // Show result reveal animation
+        _state = ClassifierState.revealingResult;
+        _recordingProgress = 0.0;
+        notifyListeners();
 
-      // Add to recent results (keep last 10)
-      _recentResults.insert(0, result);
-      if (_recentResults.length > 10) {
-        _recentResults.removeLast();
+        // After 2 seconds, return to ready state (animation will be handled in UI)
+        // This gives time for the result reveal animation to play
+        Future.delayed(const Duration(milliseconds: 2000), () {
+          if (_state == ClassifierState.revealingResult) {
+            _state = ClassifierState.ready;
+            notifyListeners();
+          }
+        });
+      } catch (e) {
+        _logger.e('Error processing audio: $e');
+        _state = ClassifierState.error;
+        _errorMessage = 'Processing error: ${e.toString()}';
+        notifyListeners();
       }
-
-      _state = ClassifierState.recording;
-      notifyListeners();
-    } catch (e) {
-      _logger.e('Error classifying audio: $e');
-      // Don't update state to error, just continue recording
-      _state = ClassifierState.recording;
-      notifyListeners();
     }
   }
 
   // Save current audio for testing or feedback
   Future<String?> saveCurrentAudio(String filename) async {
-    if (_state != ClassifierState.recording &&
-        _state != ClassifierState.ready) {
-      return null;
-    }
-
     try {
       return await _audioService.saveBufferToFile(filename);
     } catch (e) {
@@ -204,7 +235,8 @@ class ClassifierProvider with ChangeNotifier {
   // Clean up resources
   @override
   void dispose() {
-    stopClassification();
+    _recordingTimer?.cancel();
+    _audioStreamSubscription?.cancel();
     _audioService.dispose();
     _classifierService.dispose();
     super.dispose();

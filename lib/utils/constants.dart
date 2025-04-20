@@ -60,7 +60,20 @@ class AppConstants {
       'An error occurred. Please restart the app.';
   static const String noResultMessage =
       'No results yet. Tap the mic button to start recording.';
-  static const String processingMessage = 'Processing audio...';
+  static const String processingMessage = 'Analyzing the sound...';
+  static const String recordingMessage = 'Recording Lao instrument...';
+  static const String tapToStartMessage =
+      'Tap the microphone to detect instrument';
+  static const String processingCompleteMessage = 'Processing complete!';
+
+  // Shazam-like messages
+  static const String recordingInstructionMessage =
+      'Hold still and play the instrument clearly';
+  static const String listeningMessage = 'Listening...';
+  static const String identifyingMessage = 'Identifying instrument...';
+  static const String foundResultMessage = 'Found a match!';
+  static const String noMatchMessage =
+      'Could not identify this instrument. Try again?';
 
   // Instrument info
   static const String unknownInstrumentMessage =

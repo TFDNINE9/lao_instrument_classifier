@@ -1,6 +1,7 @@
-kheang
-kong_vong
+background
+khean
+khong_vong
 pin
-ra_nad
+ranad
+saw
 sing
-sor_ou

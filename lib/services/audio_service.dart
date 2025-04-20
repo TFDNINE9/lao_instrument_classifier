@@ -18,12 +18,10 @@ class AudioService {
   static const int sampleRate = 44100;
   static const int channels = 1; // Mono
   static const int bitDepth = 16;
-  static const int bufferDuration = 4; // seconds
+  static const int bufferDuration = 5; // seconds - matches our recording time
 
-  // Circular buffer for audio processing
-  final List<double> _audioBuffer =
-      List.filled(sampleRate * bufferDuration, 0.0);
-  int _bufferPosition = 0;
+  // Complete audio buffer for the session
+  final List<double> _completeAudioBuffer = [];
 
   // Stream controllers for audio data and volume
   final StreamController<List<double>> _audioStreamController =
@@ -58,14 +56,16 @@ class AudioService {
     }
 
     try {
+      // Clear previous recording buffer
+      _completeAudioBuffer.clear();
+
       // Create a temporary file for recording
       final tempDir = await getTemporaryDirectory();
       _tempFilePath = '${tempDir.path}/temp_recording.wav';
 
       // Configure and start the recorder
       await _recorder.start(
-        // Use wav encoder instead of pcm16bits
-        encoder: AudioEncoder.wav, // Updated from pcm16bits to wav
+        encoder: AudioEncoder.wav,
         samplingRate: sampleRate,
         numChannels: channels,
         path: _tempFilePath,
@@ -126,12 +126,12 @@ class AudioService {
               // Convert to double samples
               final samples = _convertPcmToDouble(audioData);
 
-              // Update buffer
-              _addToBuffer(samples);
+              // Update buffer - collect all samples for later processing
+              _addToCompleteBuffer(samples);
 
               // Notify listeners
               if (!_audioStreamController.isClosed) {
-                _audioStreamController.add(List.from(_audioBuffer));
+                _audioStreamController.add(samples);
               }
             }
           }
@@ -171,10 +171,22 @@ class AudioService {
     return samples;
   }
 
-  // Stop recording
-  Future<String?> stopRecording() async {
+  // Add new samples to the complete buffer
+  void _addToCompleteBuffer(List<double> newSamples) {
+    // Only add new samples, avoiding duplicates
+    if (_completeAudioBuffer.isEmpty) {
+      _completeAudioBuffer.addAll(newSamples);
+    } else {
+      // Determine if we need to add all samples or just new ones
+      // This is a simplistic approach - might need refinement based on exact behavior
+      _completeAudioBuffer.addAll(newSamples);
+    }
+  }
+
+  // Stop recording and return the complete audio buffer
+  Future<List<double>> stopRecording() async {
     if (!_isRecording) {
-      return null;
+      return [];
     }
 
     try {
@@ -184,21 +196,14 @@ class AudioService {
       _processingTimer?.cancel();
       _processingTimer = null;
 
-      final path = await _recorder.stop();
+      await _recorder.stop();
       _isRecording = false;
 
-      return path;
+      // Return the complete buffer for processing
+      return List<double>.from(_completeAudioBuffer);
     } catch (e) {
       _logger.e('Error stopping recording: $e');
-      return null;
-    }
-  }
-
-  // Add new samples to the circular buffer
-  void _addToBuffer(List<double> newSamples) {
-    for (final sample in newSamples) {
-      _audioBuffer[_bufferPosition] = sample;
-      _bufferPosition = (_bufferPosition + 1) % _audioBuffer.length;
+      return [];
     }
   }
 
@@ -214,19 +219,24 @@ class AudioService {
 
   // Save buffer to a WAV file
   Future<String?> saveBufferToFile(String filename) async {
+    if (_completeAudioBuffer.isEmpty) {
+      _logger.w('No audio data to save');
+      return null;
+    }
+
     try {
       final directory = await getTemporaryDirectory();
       final path = '${directory.path}/$filename.wav';
       final file = File(path);
 
       // Create WAV header
-      final ByteData header = _createWavHeader(_audioBuffer.length);
+      final ByteData header = _createWavHeader(_completeAudioBuffer.length);
 
       // Convert audio buffer to bytes
-      final ByteData audioBytes = ByteData(_audioBuffer.length * 2);
-      for (int i = 0; i < _audioBuffer.length; i++) {
+      final ByteData audioBytes = ByteData(_completeAudioBuffer.length * 2);
+      for (int i = 0; i < _completeAudioBuffer.length; i++) {
         final int sampleAsInt =
-            (_audioBuffer[i] * 32767).round().clamp(-32768, 32767);
+            (_completeAudioBuffer[i] * 32767).round().clamp(-32768, 32767);
         audioBytes.setInt16(i * 2, sampleAsInt, Endian.little);
       }
 

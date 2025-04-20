@@ -1,11 +1,15 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_spinkit/flutter_spinkit.dart';
+import 'package:percent_indicator/circular_percent_indicator.dart';
 import 'package:provider/provider.dart';
 import '../../providers/classifier_provider.dart';
 import '../../utils/constants.dart';
 import '../widgets/audio_visualizer.dart';
 import '../widgets/confidence_meter.dart';
 import '../widgets/instrument_card.dart';
+import '../widgets/processing_animation.dart';
+import '../widgets/recording_progress_indicator.dart';
+import '../widgets/result_reveal_animation.dart';
 import 'result_screen.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -57,8 +61,9 @@ class _HomeScreenState extends State<HomeScreen>
   @override
   Widget build(BuildContext context) {
     final provider = Provider.of<ClassifierProvider>(context);
-    final isRecording = provider.state == ClassifierState.recording ||
-        provider.state == ClassifierState.processing;
+    final isRecording = provider.state == ClassifierState.recording;
+    final isProcessing = provider.state == ClassifierState.processing;
+    final isRevealing = provider.state == ClassifierState.revealingResult;
 
     return Scaffold(
       appBar: AppBar(
@@ -110,7 +115,8 @@ class _HomeScreenState extends State<HomeScreen>
         ),
       ),
       // Floating action button for recording
-      floatingActionButton: _buildRecordButton(provider, isRecording),
+      floatingActionButton:
+          _buildRecordButton(provider, isRecording, isProcessing),
       floatingActionButtonLocation: FloatingActionButtonLocation.centerFloat,
     );
   }
@@ -130,6 +136,7 @@ class _HomeScreenState extends State<HomeScreen>
       case ClassifierState.ready:
       case ClassifierState.recording:
       case ClassifierState.processing:
+      case ClassifierState.revealingResult:
         return _buildReadyState(provider);
 
       default:
@@ -243,30 +250,51 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   Widget _buildReadyState(ClassifierProvider provider) {
-    final isRecording = provider.state == ClassifierState.recording ||
-        provider.state == ClassifierState.processing;
+    final isRecording = provider.state == ClassifierState.recording;
     final isProcessing = provider.state == ClassifierState.processing;
+    final isRevealing = provider.state == ClassifierState.revealingResult;
 
     return SingleChildScrollView(
       padding: const EdgeInsets.fromLTRB(16, 16, 16, 80),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          // Audio visualizer
-          AudioVisualizer(
-            volumeStream: provider.volumeStream,
-            isRecording: isRecording,
-          ),
+          // Audio visualizer/recording indicator/processing animation/result reveal
+          if (isRevealing && provider.currentResult != null)
+            ResultRevealAnimation(
+              result: provider.currentResult!,
+              onComplete: () {
+                // This will be called when the animation completes
+                // You can add extra behavior here if needed
+              },
+            )
+          else if (isProcessing)
+            const ProcessingAnimation()
+          else if (isRecording)
+            RecordingProgressIndicator(
+              progress: provider.recordingProgress,
+              volumeStream: provider.volumeStream,
+            )
+          else
+            AudioVisualizer(
+              volumeStream: provider.volumeStream,
+              isRecording: isRecording,
+            ),
           const SizedBox(height: 16),
 
           // Status text
           Center(
             child: Text(
-              isProcessing
-                  ? AppConstants.processingMessage
-                  : isRecording
-                      ? 'Recording... Tap the button to stop'
-                      : 'Tap the microphone button to start recording',
+              isRevealing
+                  ? provider.currentResult != null &&
+                          !provider.currentResult!.isUnknown
+                      ? "It's a ${provider.currentResult!.instrument.name}!"
+                      : AppConstants.noMatchMessage
+                  : isProcessing
+                      ? AppConstants.identifyingMessage
+                      : isRecording
+                          ? AppConstants.recordingInstructionMessage
+                          : AppConstants.tapToStartMessage,
               style: AppTextStyles.body2,
             ),
           ),
@@ -368,7 +396,10 @@ class _HomeScreenState extends State<HomeScreen>
     );
   }
 
-  Widget _buildRecordButton(ClassifierProvider provider, bool isRecording) {
+  Widget _buildRecordButton(
+      ClassifierProvider provider, bool isRecording, bool isProcessing) {
+    final isRevealing = provider.state == ClassifierState.revealingResult;
+
     return GestureDetector(
       onTapDown: (_) => _animationController.forward(),
       onTapUp: (_) => _animationController.reverse(),
@@ -376,16 +407,28 @@ class _HomeScreenState extends State<HomeScreen>
       child: ScaleTransition(
         scale: _scaleAnimation,
         child: FloatingActionButton(
-          onPressed: () {
-            if (isRecording) {
-              provider.stopClassification();
-            } else {
-              provider.startClassification();
-            }
-          },
-          backgroundColor: isRecording ? AppColors.accent : AppColors.primary,
+          onPressed: isProcessing || isRevealing
+              ? null // Disable button during processing or revealing
+              : () {
+                  if (isRecording) {
+                    provider.stopClassification();
+                  } else {
+                    provider.startClassification();
+                  }
+                },
+          backgroundColor: isProcessing || isRevealing
+              ? Colors.grey
+              : isRecording
+                  ? AppColors.accent
+                  : AppColors.primary,
           child: Icon(
-            isRecording ? Icons.stop : Icons.mic,
+            isProcessing
+                ? Icons.hourglass_top
+                : isRevealing
+                    ? Icons.music_note
+                    : isRecording
+                        ? Icons.stop
+                        : Icons.mic,
             size: 32,
           ),
         ),
